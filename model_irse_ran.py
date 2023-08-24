@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import pdb
+from torch.nn import Linear, Conv2d, BatchNorm1d, BatchNorm2d, PReLU, ReLU, Sigmoid, Dropout, MaxPool2d, \
+    AdaptiveAvgPool2d, Sequential, Module
+from collections import namedtuple
+
+
+# Support: ['IR_50', 'IR_101', 'IR_152', 'IR_SE_50', 'IR_SE_101', 'IR_SE_152']
+
+
+class Flatten(Module):
+    def forward(self, input):
+        return input.view(input.size(0), -1)
+
+
+def l2_norm(input, axis=1):
+    norm = torch.norm(input, 2, axis, True)
+    output = torch.div(input, norm)
+
+    return output
+
+
+class SEModule(Module):
+    def __init__(self, channels, reduction):
+        super(SEModule, self).__init__()
+        self.avg_pool = AdaptiveAvgPool2d(1)
+        self.fc1 = Conv2d(
+            channels, channels // reduction, kernel_size=1, padding=0, bias=False)
+
+        nn.init.xavier_uniform_(self.fc1.weight.data)
+
+        self.relu = ReLU(inplace=True)
+        self.fc2 = Conv2d(
+            channels // reduction, channels, kernel_size=1, padding=0, bias=False)
+
+        self.sigmoid = Sigmoid()
+
+    def forward(self, x):
+        module_input = x
+        x = self.avg_pool(x)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+
+        return module_input * x
+
+
+class bottleneck_IR(Module):
+    def __init__(self, in_channel, depth, stride):
+        super(bottleneck_IR, self).__init__()
+        if in_channel == depth:
+            self.shortcut_layer = MaxPool2d(1, stride)
+        else:
+            self.shortcut_layer = Sequential(
+                Conv2d(in_channel, depth, (1, 1), stride, bias=False), BatchNorm2d(depth))
+        self.res_layer = Sequential(
+            BatchNorm2d(in_channel),
+            Conv2d(in_channel, depth, (3, 3), (1, 1), 1, bias=False), PReLU(depth),
+            Conv2d(depth, depth, (3, 3), stride, 1, bias=False), BatchNorm2d(depth))
+
+    def forward(self, x):
+        shortcut = self.shortcut_layer(x)
+        res = self.res_layer(x)
+
+        return res + shortcut
+
+
+class bottleneck_IR_SE(Module):
+    def __init__(self, in_channel, depth, stride):
+        super(bottleneck_IR_SE, self).__init__()
+        if in_channel == depth:
+            self.shortcut_layer = MaxPool2d(1, stride)
+        else:
+            self.shortcut_layer = Sequential(
+                Conv2d(in_channel, depth, (1, 1), stride, bias=False),
+                BatchNorm2d(depth))
+        self.res_layer = Sequential(
+            BatchNorm2d(in_channel),
+            Conv2d(in_channel, depth, (3, 3), (1, 1), 1, bias=False),
+            PReLU(depth),
+            Conv2d(depth, depth, (3, 3), stride, 1, bias=False),
+            BatchNorm2d(depth),
+            SEModule(depth, 16)
+        )
+
+    def forward(self, x):
+        shortcut = self.shortcut_layer(x)
+        res = self.res_layer(x)
+
+        return res + shortcut
+
+
+class Bottleneck(namedtuple('Block', ['in_channel', 'depth', 'stride'])):
+    '''A named tuple describing a ResNet block.'''
+
+
+def get_block(in_channel, depth, num_units, stride=2):
+
+    return [Bottleneck(in_channel, depth, stride)] + [Bottleneck(depth, depth, 1) for i in range(num_units - 1)]
+
+
+def get_blocks(num_layers):
+    if num_layers == 50:
+        blocks = [
+            get_block(in_channel=64, depth=64, num_units=3),
+            get_block(in_channel=64, depth=128, num_units=4),
+            get_block(in_channel=128, depth=256, num_units=14),
+            get_block(in_channel=256, depth=512, num_units=3)
+        ]
+    elif num_layers == 100:
+        blocks = [
+            get_block(in_channel=64, depth=64, num_units=3),
+            get_block(in_channel=64, depth=128, num_units=13),
+            get_block(in_channel=128, depth=256, num_units=30),
+            get_block(in_channel=256, depth=512, num_units=3)
+        ]
+    elif num_layers == 152:
+        blocks = [
+            get_block(in_channel=64, depth=64, num_units=3),
+            get_block(in_channel=64, depth=128, num_units=8),
+            get_block(in_channel=128, depth=256, num_units=36),
+            get_block(in_channel=256, depth=512, num_units=3)
+        ]
+
+    return blocks
+
+
+class Backbone(Module):
+    def __init__(self, input_size, num_layers, mode='ir'):
+        super(Backbone, self).__init__()
+        assert input_size[0] in [112, 224], "input_size should be [112, 112] or [224, 224]"
+        assert num_layers in [50, 100, 152], "num_layers should be 50, 100 or 152"
+        assert mode in ['ir', 'ir_se'], "mode should be ir or ir_se"
+        blocks = get_blocks(num_layers)
+        if mode == 'ir':
+            unit_module = bottleneck_IR
+        elif mode == 'ir_se':
+            unit_module = bottleneck_IR_SE
+        self.input_layer = Sequential(Conv2d(3, 64, (3, 3), 1, 1, bias=False),
+                                      BatchNorm2d(64),
+                                      PReLU(64))
+        self.last_avg_pool = AdaptiveAvgPool2d(7)
+        self.last_sigmoid = Sigmoid()
+        # self.threshold = torch.nn.Parameter(torch.Tensor([0.2441461831331253, 0.24752627313137054, 0.2218620628118515, 0.2728258967399597, 0.26144522428512573, 0.23714768886566162, 0.49276357889175415, 0.3080540895462036, 0.2495800107717514, 0.22424452006816864, 0.2566404640674591, 0.2132071703672409, 0.2995612323284149, 0.35681384801864624, 0.251033753156662, 0.28057780861854553, 0.23900949954986572, 0.24640558660030365, 0.24852819740772247, 0.30659112334251404, 0.2698735296726227, 0.26886457204818726, 0.25400546193122864]))
+        # self.threshold = torch.nn.Parameter(torch.Tensor(torch.ones(23)/2))
+        if input_size[0] == 224:
+            self.output_layer = Sequential(BatchNorm2d(512),
+                                           Dropout(),
+                                           Flatten(),
+                                           Linear(512 * 7 * 7, 512),
+                                           BatchNorm1d(512))
+        else:
+            self.output_layer = Sequential(BatchNorm2d(512),
+                                           Dropout(),
+                                           Flatten(),
+                                           Linear(512 * 14 * 14, 512),
+                                           BatchNorm1d(512))
+
+        modules = []
+        for block in blocks:
+            for bottleneck in block:
+                modules.append(
+                    unit_module(bottleneck.in_channel,
+                                bottleneck.depth,
+                                bottleneck.stride))
+        self.body = Sequential(*modules)
+        self.alpha = nn.Sequential(nn.Linear(512, 1),
+                                   nn.Sigmoid())
+        self.beta = nn.Sequential(nn.Linear(1024, 1),
+                                  nn.Sigmoid())
+        self.kw_fc = nn.Linear(1024,23)
+
+        self._initialize_weights()
+
+    def forward(self, x):
+        # import pdb; pdb.set_trace()
+        # N = x.shape[0]
+        # threshold = self.threshold*N
+        vs = []
+        alphas = []
+        for i in range(6):
+            f = x[:,:,:,:,i]
+            f = self.input_layer(f)
+            f = self.body(f)
+            f = self.last_avg_pool(f) #如果要用224输入，请加上这句
+            # pdb.set_trace()
+            f = self.output_layer(f)
+            # import pdb;pdb.set_trace()
+            # f = f.squeeze(3).squeeze(2)
+            #MN_MODEL
+            vs.append(f)
+            alphas.append(self.alpha(f))
+        vs_stack = torch.stack(vs, dim=2)
+        alphas_stack = torch.stack(alphas, dim=2)
+        vm = vs_stack.mul(alphas_stack).sum(2).div(alphas_stack.sum(2))
+        for i in range(len(vs)):
+            vs[i] = torch.cat([vs[i], vm], dim=1)
+        vs_stack_4096 = torch.stack(vs, dim=2)
+        betas = []
+        for index, v in enumerate(vs):
+            betas.append(self.beta(v))
+        betas_stack = torch.stack(betas, dim=2)
+        # import pdb; pdb.set_trace()
+
+        #output = vs_stack_4096.mul(betas_stack).sum(2).div(betas_stack.sum(2))
+        #index_image = torch.max((betas_stack*alphas_stack),1)
+        # pdb.set_trace()
+        output = vs_stack_4096.mul(betas_stack*alphas_stack).sum(2).div((betas_stack*alphas_stack).sum(2))
+        #output = vs_stack_4096.mul(1.0*alphas_stack).sum(2).div((1.0*alphas_stack).sum(2))
+        output = output.view(output.size(0), -1)
+        #max, index = torch.max(betas_stack*alphas_stack)
+        #pdb.set_trace()
+        # pred_score = self.fc(output)
+        # x = self.output_layer(x)
+        x = self.kw_fc(output)
+        # x = self.last_sigmoid(x)
+        # import pdb; pdb.set_trace()
+        # x = x - self.threshold
+        # x[x<=0] = 0
+        # x[x>0] = 1
+        # import pdb; pdb.set_trace()
+
+        return x
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm1d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+
+
+def IR_50(input_size):
+    """Constructs a ir-50 model.
+    """
+    model = Backbone(input_size, 50, 'ir')
+
+    return model
+
+
+def IR_101(input_size):
+    """Constructs a ir-101 model.
+    """
+    model = Backbone(input_size, 100, 'ir')
+
+    return model
+
+
+def IR_152(input_size):
+    """Constructs a ir-152 model.
+    """
+    model = Backbone(input_size, 152, 'ir')
+
+    return model
+
+
+def IR_SE_50(input_size):
+    """Constructs a ir_se-50 model.
+    """
+    model = Backbone(input_size, 50, 'ir_se')
+
+    return model
+
+
+def IR_SE_101(input_size):
+    """Constructs a ir_se-101 model.
+    """
+    model = Backbone(input_size, 100, 'ir_se')
+
+    return model
+
+
+def IR_SE_152(input_size):
+    """Constructs a ir_se-152 model.
+    """
+    model = Backbone(input_size, 152, 'ir_se')
+
+    return model
